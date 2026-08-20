@@ -87,7 +87,6 @@ class RLTrainingConfig:
 
     # Search budgets (RLHybridReasoner).
     top_k_tactics: int = 4
-    top_k_subgoals: int = 3
     max_depth: int = 8
     max_nodes: int = 64
     # Set to False to disable all PLN involvement (no petta subprocess, no reward
@@ -498,7 +497,6 @@ async def _create_live_reasoner(
         executor=PantographExecutor(server),
         device=device,
         top_k_tactics=cfg.top_k_tactics,
-        top_k_subgoals=cfg.top_k_subgoals,
         max_depth=cfg.max_depth,
         max_nodes=cfg.max_nodes,
         use_pln=cfg.use_pln,
@@ -621,20 +619,6 @@ async def run_rl_training(
             reasoner, batch, timeout_s=cfg.theorem_timeout_s
         )
 
-        # A round that collects nothing took no optimizer step, so it must not
-        # weaken the BC anchor (Issue 4) — and enough of them in a row means the
-        # Lean environment cannot elaborate the pool at all, in which case the
-        # run is looping on a misconfiguration. Stop loudly instead of annealing
-        # quietly for hours.
-        dead_rounds = dead_rounds + 1 if not results else 0
-        if dead_rounds >= cfg.max_dead_rounds:
-            raise RuntimeError(
-                f"Round {round_idx}: {dead_rounds} consecutive rounds produced no "
-                f"transitions ({collect_stats['searches_failed']:.0f} searches "
-                f"failed). Check that --source-root points at the compiled "
-                f"mathlib_lean project and that the toolchains match."
-            )
-
         # Indexed by optimizer steps taken, not loop iterations: a dead round leaves
         # the policy unchanged, so the anchor it needs is unchanged too.
         bc_weight = bc_weight_at_round(anneal_rounds_done, cfg)
@@ -655,9 +639,27 @@ async def run_rl_training(
                 max_update_nodes=cfg.max_update_nodes,
                 max_update_edges=cfg.max_update_edges,
             )
-            anneal_rounds_done += 1
         else:
-            metrics = {"num_transitions": 0.0, "num_failures": 0.0}
+            metrics = {
+                "num_transitions": 0.0,
+                "num_critic_samples": 0.0,
+                "num_failures": 0.0,
+                "optimizer_step": 0.0,
+            }
+
+        took_optimizer_step = bool(metrics.get("optimizer_step", 0.0))
+        if took_optimizer_step:
+            anneal_rounds_done += 1
+            dead_rounds = 0
+        else:
+            dead_rounds += 1
+        if dead_rounds >= cfg.max_dead_rounds:
+            raise RuntimeError(
+                f"Round {round_idx}: {dead_rounds} consecutive rounds produced no valid "
+                f"actor or critic training rows ({collect_stats['searches_failed']:.0f} "
+                f"searches failed). Check that --source-root points at the compiled "
+                f"mathlib_lean project and that the toolchains match."
+            )
 
         # Curriculum: grow when the recent training-window solve rate crosses threshold.
         solve_rate = collect_stats["solved"] / (collect_stats["attempted"] or 1.0)

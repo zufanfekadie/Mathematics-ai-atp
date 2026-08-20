@@ -1,143 +1,238 @@
-"""Harvest actor-critic training targets from a finished ``ProofHypergraph`` (B3, AND-OR).
-
-The hybrid reasoner's search produces an AND-OR proof graph whose solved/dead status is
-back-propagated to the root. This module turns that graph into per-transition training
-targets: a value target for the critic (from the AND-OR value backup) and a return for the
-actor (shaped reward + bootstrapped successor value). The actor advantage
-``Â = return − V_pred(s)`` is finished in the training loop, where the critic's prediction at
-collection time is known.
-
-Value backup (one-sided provability signal, per the approaches doc):
-  * SOLVED node                → 1.0
-  * DEAD node                  → 0.0
-  * interior node (OR over tactics): ``max_edge AND-combine(children)``
-  * AND-combine (all subgoals must close): product (default) or min of child values
-  * unexpanded / unresolved leaf → 0.0 (not yet shown provable — keeps PLN out of the target)
-"""
+"""Extract validity-aware actor and critic targets from an AND-OR search graph."""
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
 
 from maths_ai.data_models.proof_components import Goal, TacticCandidate
 from maths_ai.hybrid_reasoner.hypergraph import (
     EdgeStatus,
+    NodeClosureReason,
     NodeStatus,
     ProofHypergraph,
+    SearchEndReason,
 )
-
 from .pln_reward import RewardConfig, edge_shaped_reward
+
+
+class BackupValidity(str, Enum):
+    KNOWN = "known"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class BackupValue:
+    value: Optional[float]
+    validity: BackupValidity
+
+    def __post_init__(self) -> None:
+        if self.validity is BackupValidity.KNOWN:
+            if self.value is None or not math.isfinite(self.value) or not 0.0 <= self.value <= 1.0:
+                raise ValueError("KNOWN backup values must be finite numbers in [0, 1]")
+        elif self.value is not None:
+            raise ValueError("UNKNOWN backup values must not carry a numeric value")
+
+    @classmethod
+    def known(cls, value: float) -> "BackupValue":
+        return cls(float(value), BackupValidity.KNOWN)
+
+    @classmethod
+    def unknown(cls) -> "BackupValue":
+        return cls(None, BackupValidity.UNKNOWN)
+
+    @property
+    def is_known(self) -> bool:
+        return self.validity is BackupValidity.KNOWN
+
+
+@dataclass(frozen=True)
+class BackupTables:
+    edge_outcomes: dict[int, BackupValue]
+    node_targets: dict[int, BackupValue]
 
 
 @dataclass(frozen=True)
 class HarvestConfig:
-    and_combine: str = "product"  # "product" or "min"
-    unresolved_leaf_value: float = 0.0
+    and_combine: str = "product"
+
+    def __post_init__(self) -> None:
+        if self.and_combine not in {"product", "min"}:
+            raise ValueError(f"Unknown AND combine mode: {self.and_combine}")
 
 
-@dataclass
-class HarvestedTransition:
-    """One (state, action) training example extracted from the search graph."""
+@dataclass(frozen=True)
+class ActorTransition:
     node_id: int
-    goal: Goal                 # state s (expression + hypotheses)
-    tactic: TacticCandidate    # action a = (tactic, args)
-    reward: float              # shaped per-edge reward r'  (r_term + γΦ(s')−Φ(s))
-    children_value: float      # AND-combined backup value of the edge's subgoals (bootstrap)
-    value_target: float        # AND-OR backup value of s  (critic regression target)
-    return_: float             # reward + γ·children_value  (actor target return)
-    edge_id: int = -1          # source hyperedge — the on-policy join key to EdgeAction
+    goal: Goal
+    tactic: TacticCandidate
+    reward: float
+    successor_value: float
+    return_: float
+    edge_id: int = -1
 
 
-def _and_combine(values: list[float], cfg: HarvestConfig) -> float:
+@dataclass(frozen=True)
+class CriticSample:
+    node_id: int
+    goal: Goal
+    target: float
+
+
+def _and_combine(values: list[BackupValue], cfg: HarvestConfig) -> BackupValue:
     if not values:
-        return 1.0  # no subgoals ⇒ branch closed (QED)
+        return BackupValue.known(1.0)
+    if any(v.is_known and v.value == 0.0 for v in values):
+        return BackupValue.known(0.0)
+    if any(not v.is_known for v in values):
+        return BackupValue.unknown()
     if cfg.and_combine == "min":
-        return min(values)
+        return BackupValue.known(min(float(v.value) for v in values))
+    if cfg.and_combine != "product":
+        raise ValueError(f"Unknown AND combine mode: {cfg.and_combine}")
     product = 1.0
-    for v in values:
-        product *= v
-    return product
+    for value in values:
+        product *= float(value.value)
+    return BackupValue.known(product)
 
 
-def backup_values(
-    graph: ProofHypergraph,
-    cfg: HarvestConfig | None = None,
-) -> dict[int, float]:
-    """Compute the AND-OR value backup for every node (memoized, cycle-safe)."""
+_INCOMING_EDGE_FAILURE_REASONS = frozenset({
+    NodeClosureReason.DEPTH_LIMIT,
+    NodeClosureReason.CYCLE,
+})
+_STATE_LABEL_REASONS = frozenset({
+    NodeClosureReason.CANDIDATES_EXHAUSTED,
+    NodeClosureReason.NO_CANDIDATES,
+})
+
+
+def compute_backups(graph: ProofHypergraph, cfg: HarvestConfig | None = None) -> BackupTables:
+    """Compute separate edge outcomes and unique state-level critic targets."""
     cfg = cfg or HarvestConfig()
-    memo: dict[int, float] = {}
+    node_memo: dict[int, BackupValue] = {}
+    edge_memo: dict[int, BackupValue] = {}
     in_progress: set[int] = set()
 
-    def value(node_id: int) -> float:
-        if node_id in memo:
-            return memo[node_id]
+    def standalone_node(node_id: int) -> BackupValue:
+        if node_id in node_memo:
+            return node_memo[node_id]
         if node_id in in_progress:
-            # Cycle (a subgoal identical to an ancestor): treat as unresolved.
-            return cfg.unresolved_leaf_value
+            return BackupValue.unknown()
         node = graph.nodes[node_id]
         if node.status == NodeStatus.SOLVED:
-            memo[node_id] = 1.0
-            return 1.0
-        if node.status == NodeStatus.DEAD:
-            memo[node_id] = 0.0
-            return 0.0
-
+            result = BackupValue.known(1.0)
+            node_memo[node_id] = result
+            return result
+        if node_id == graph.root_id and node.closure_reason == NodeClosureReason.DEPTH_LIMIT:
+            result = BackupValue.known(0.0)
+            node_memo[node_id] = result
+            return result
+        if node.closure_reason not in (NodeClosureReason.NONE, *_STATE_LABEL_REASONS):
+            result = BackupValue.unknown()
+            node_memo[node_id] = result
+            return result
         in_progress.add(node_id)
-        edge_values: list[float] = []
-        for edge_id in node.outgoing_edge_ids:
-            edge = graph.edges[edge_id]
-            if edge.status == EdgeStatus.DEAD:
-                edge_values.append(0.0)
-                continue
-            child_values = [value(cid) for cid in edge.child_ids]
-            edge_values.append(_and_combine(child_values, cfg))
-        in_progress.discard(node_id)
+        outcomes = [edge_outcome(edge_id) for edge_id in node.outgoing_edge_ids]
+        in_progress.remove(node_id)
+        if any(value.is_known and value.value == 1.0 for value in outcomes):
+            result = BackupValue.known(1.0)
+        elif (
+            node.closure_reason in _STATE_LABEL_REASONS
+            and outcomes
+            and all(value.is_known and value.value == 0.0 for value in outcomes)
+        ) or (node.closure_reason in _STATE_LABEL_REASONS and not outcomes):
+            result = BackupValue.known(0.0)
+        else:
+            result = BackupValue.unknown()
+        node_memo[node_id] = result
+        return result
 
-        # OR over tactics; an unexpanded interior node (no edges) is unresolved.
-        val = max(edge_values) if edge_values else cfg.unresolved_leaf_value
-        memo[node_id] = val
-        return val
+    def child_evidence(node_id: int) -> BackupValue:
+        node = graph.nodes[node_id]
+        if node.status == NodeStatus.SOLVED:
+            return BackupValue.known(1.0)
+        if node.closure_reason in _INCOMING_EDGE_FAILURE_REASONS:
+            return BackupValue.known(0.0)
+        if node.closure_reason in {
+            NodeClosureReason.ELABORATION_ERROR,
+            NodeClosureReason.INFRASTRUCTURE_FAILURE,
+        }:
+            return BackupValue.unknown()
+        return standalone_node(node_id)
 
-    return {node_id: value(node_id) for node_id in graph.nodes}
+    def edge_outcome(edge_id: int) -> BackupValue:
+        if edge_id in edge_memo:
+            return edge_memo[edge_id]
+        edge = graph.edges[edge_id]
+        if edge.status == EdgeStatus.DEAD and not edge.child_ids:
+            result = BackupValue.known(0.0)
+        else:
+            result = _and_combine([child_evidence(child_id) for child_id in edge.child_ids], cfg)
+        edge_memo[edge_id] = result
+        return result
+
+    for edge_id in graph.edges:
+        edge_outcome(edge_id)
+    for node_id in graph.nodes:
+        standalone_node(node_id)
+    return BackupTables(edge_outcomes=edge_memo, node_targets=node_memo)
 
 
-def extract_transitions(
+def extract_actor_transitions(
     graph: ProofHypergraph,
     reward_cfg: RewardConfig | None = None,
     harvest_cfg: HarvestConfig | None = None,
     *,
     edge_ids: list[int] | None = None,
-) -> list[HarvestedTransition]:
-    """Turn the search graph into per-transition training targets.
-
-    One ``HarvestedTransition`` per hyperedge (an applied tactic). ``edge_ids`` restricts to a
-    subset — the on-policy training loop passes only the edges whose tactic was sampled from
-    the current policy, so the collected targets are on-policy. Without it, every edge is
-    harvested (useful for tests and off-policy analysis).
-    """
+) -> list[ActorTransition]:
+    """Harvest one actor row for each selected edge with valid successor evidence."""
     reward_cfg = reward_cfg or RewardConfig()
-    harvest_cfg = harvest_cfg or HarvestConfig()
-    values = backup_values(graph, harvest_cfg)
-
-    chosen = edge_ids if edge_ids is not None else list(graph.edges.keys())
-    transitions: list[HarvestedTransition] = []
+    tables = compute_backups(graph, harvest_cfg)
+    chosen = edge_ids if edge_ids is not None else list(graph.edges)
+    transitions: list[ActorTransition] = []
     for edge_id in chosen:
+        outcome = tables.edge_outcomes[edge_id]
+        if not outcome.is_known:
+            continue
         edge = graph.edges[edge_id]
-        parent = graph.nodes[edge.source_id]
         reward = edge_shaped_reward(edge, graph, reward_cfg)
-        child_values = [values[cid] for cid in edge.child_ids]
-        children_value = _and_combine(child_values, harvest_cfg)
-        return_ = reward + reward_cfg.gamma * children_value
-        transitions.append(
-            HarvestedTransition(
-                node_id=parent.id,
-                goal=parent.goal,
-                tactic=edge.tactic,
-                reward=reward,
-                children_value=children_value,
-                value_target=values[parent.id],
-                return_=return_,
-                edge_id=edge_id,
-            )
-        )
+        successor_value = float(outcome.value)
+        transitions.append(ActorTransition(
+            node_id=edge.source_id,
+            goal=graph.nodes[edge.source_id].goal,
+            tactic=edge.tactic,
+            reward=reward,
+            successor_value=successor_value,
+            return_=reward + reward_cfg.gamma * successor_value,
+            edge_id=edge_id,
+        ))
     return transitions
+
+
+def extract_critic_samples(
+    graph: ProofHypergraph,
+    harvest_cfg: HarvestConfig | None = None,
+) -> list[CriticSample]:
+    """Harvest one valid critic row per unique state, including root budget failure."""
+    tables = compute_backups(graph, harvest_cfg)
+    samples = [
+        CriticSample(node_id=node_id, goal=graph.nodes[node_id].goal, target=float(target.value))
+        for node_id, target in tables.node_targets.items()
+        if target.is_known
+    ]
+    if (
+        graph.search_end_reason == SearchEndReason.MAX_NODES
+        and not graph.is_solved()
+        and not any(
+            node.closure_reason in {
+                NodeClosureReason.ELABORATION_ERROR,
+                NodeClosureReason.INFRASTRUCTURE_FAILURE,
+            }
+            for node in graph.nodes.values()
+        )
+        and not any(sample.node_id == graph.root_id for sample in samples)
+    ):
+        samples.append(CriticSample(node_id=graph.root_id, goal=graph.root.goal, target=0.0))
+    return samples
