@@ -61,7 +61,7 @@ def _state_key(goal: Goal) -> str:
     structurally-identical states with different concrete names are
     different proof obligations and must not collapse together.
     """
-    hyps = "||".join(sorted(h.strip() for h in goal.hypotheses))
+    hyps = "||".join(sorted(h.render().strip() for h in goal.hypotheses))
     return f"{goal.expression.strip()}::{hyps}"
 
 

@@ -202,7 +202,7 @@ def _has_metavariable(goal: Goal) -> bool:
     """True when the goal or any hypothesis mentions an unassigned metavariable."""
     if _METAVARIABLE_RE.search(goal.expression):
         return True
-    return any(_METAVARIABLE_RE.search(hypothesis) for hypothesis in goal.hypotheses)
+    return any(_METAVARIABLE_RE.search(hypothesis.render()) for hypothesis in goal.hypotheses)
 
 
 def _row_state_to_goal(state_str: str) -> Goal:
@@ -264,7 +264,7 @@ def build_theorem_pool(cfg: RLTrainingConfig) -> TheoremPool:
                     continue
                 row = json.loads(line)
                 goal = Goal(expression=row["goal"], hypotheses=row.get("hypotheses", []))
-                size = len(goal.expression) + sum(len(h) for h in goal.hypotheses)
+                size = len(goal.expression) + sum(len(h.render()) for h in goal.hypotheses)
                 if size > cfg.max_state_chars:
                     dropped += 1
                     continue
@@ -351,7 +351,7 @@ async def collect_round(
     for item in batch:
         try:
             result = await asyncio.wait_for(
-                reasoner.prove(item.goal.expression, hypotheses=item.goal.hypotheses, greedy=greedy),
+                reasoner.prove(item.goal.expression, hypotheses=[h.render() for h in item.goal.hypotheses], greedy=greedy),
                 timeout=timeout_s,
             )
             results.append(result)

@@ -83,14 +83,14 @@ class FailureRecord:
 def goal_to_state(goal: Goal) -> str:
     """Render a ``Goal`` as the proof-state string the parser expects.
 
-    ``Goal.hypotheses`` are Pantograph's ``name : type`` lines; joining them above the
+    ``Goal.hypotheses`` retain Pantograph's local declaration structure; rendering them above the
     turnstile reproduces the state the executor observed, so the DAG contains the
     hypothesis nodes the pointer needs as argument candidates. A goal with no
     hypotheses passes its expression through unchanged (it may already embed a full
     state string, as the harvest tests do).
     """
     if goal.hypotheses:
-        return "\n".join(goal.hypotheses) + "\n⊢ " + goal.expression
+        return "\n".join(hypothesis.render() for hypothesis in goal.hypotheses) + "\n⊢ " + goal.expression
     return goal.expression
 
 

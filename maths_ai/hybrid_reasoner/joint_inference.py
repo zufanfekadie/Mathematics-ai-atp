@@ -12,7 +12,7 @@ from time import perf_counter
 from typing import Dict, List, Optional
 from pantograph.server import Server, GoalState, ServerError, ParseError
 
-from maths_ai.data_models.proof_components import Goal, RankedSubgoal, STV, TacticCandidate
+from maths_ai.data_models.proof_components import Goal, LocalDeclaration, RankedSubgoal, STV, TacticCandidate
 from maths_ai.gnn_inference.inference_engine import GNNModelEngine
 from maths_ai.pln_inference.model import PLNInference
 from maths_ai.pln_inference.metta.translator.translator_modules.runner import DynamicThompsonSampler
@@ -95,7 +95,7 @@ def _sanitize_inaccessible_names(goal: Goal) -> Goal:
     every hypothesis keeps the goal semantically identical while making it
     parseable again.
     """
-    text = " ".join([goal.expression, *goal.hypotheses])
+    text = " ".join([goal.expression, *(h.render() for h in goal.hypotheses)])
     tokens = sorted(set(_INACCESSIBLE_NAME_RE.findall(text)))
     if not tokens:
         return goal
@@ -113,7 +113,14 @@ def _sanitize_inaccessible_names(goal: Goal) -> Goal:
 
     return Goal(
         expression=substitute(goal.expression),
-        hypotheses=[substitute(h) for h in goal.hypotheses],
+        hypotheses=[
+            h.model_copy(update={
+                "name": substitute(h.name),
+                "type_expression": substitute(h.type_expression),
+                "value_expression": substitute(h.value_expression) if h.value_expression else None,
+            })
+            for h in goal.hypotheses
+        ],
     )
 def plot_hypergraph(graph: ProofHypergraph) -> None:
     """Utility to visualize the proof hypergraph with Graphviz (for debugging
@@ -183,7 +190,18 @@ class PantographExecutor(TacticExecutor):
             return TacticOutcome(success=False, subgoals=[], error=str(e))
 
         subgoals = [
-            Goal(expression=str(g.target), hypotheses=[str(v) for v in g.variables])
+            Goal(
+                expression=str(g.target),
+                hypotheses=[
+                    LocalDeclaration(
+                        name=v.name or "_",
+                        type_expression=str(v.t),
+                        value_expression=str(v.v) if v.v is not None else None,
+                        kind="let" if v.v is not None else "variable",
+                    )
+                    for v in g.variables
+                ],
+            )
             for g in new_state.goals
         ]
         return TacticOutcome(success=True, subgoals=subgoals, error=None)
@@ -395,7 +413,7 @@ class HybridReasoner:
             *(
                 self.petta_chainer.evaluate_async(
                     subgoal.expression,
-                    hypotheses=[goal, *subgoal.hypotheses],
+                    hypotheses=[goal, *(h.render() for h in subgoal.hypotheses)],
                 )
                 for subgoal in sub_goals
             )
@@ -508,7 +526,10 @@ class HybridReasoner:
         goal = _sanitize_inaccessible_names(goal)
         expression = goal.expression
         for hypothesis in reversed(goal.hypotheses):
-            expression = f"∀ ({hypothesis}), {expression}"
+            if hypothesis.kind == "let":
+                expression = f"let {hypothesis.name} : {hypothesis.type_expression} := {hypothesis.value_expression}\n{expression}"
+            else:
+                expression = f"∀ ({hypothesis.render()}), {expression}"
 
         try:
             return await self._goal_state_for(expression, goal)
@@ -534,8 +555,9 @@ class HybridReasoner:
     async def _goal_state_for(self, expression: str, goal: Goal) -> GoalState:
         """Start ``expression`` and re-``intro`` ``goal``'s hypotheses."""
         state = await self.server.goal_start_async(expression)
-        if goal.hypotheses:
-            names = " ".join(hypothesis.split(":", 1)[0].strip() for hypothesis in goal.hypotheses)
+        variable_names = [hypothesis.name for hypothesis in goal.hypotheses if hypothesis.kind == "variable"]
+        if variable_names:
+            names = " ".join(variable_names)
             state = await self.server.goal_tactic_async(state, f"intro {names}")
         return state
 
@@ -634,11 +656,11 @@ class HybridReasoner:
             print(f"  [PLN Fallback] evaluating goal: {node.goal.expression}  hyps: {node.goal.hypotheses}")
             pln_result = await self.petta_chainer.evaluate_async(
                 node.goal.expression,
-                hypotheses=[*node.goal.hypotheses],
+                hypotheses=[h.render() for h in node.goal.hypotheses],
             )
 
             stv = pln_result.stv
-            pln_fb_key = f"PLN_fb::{node.goal.expression}::{'|'.join(node.goal.hypotheses)}"
+            pln_fb_key = f"PLN_fb::{node.goal.expression}::{'|'.join(h.render() for h in node.goal.hypotheses)}"
 
             if pln_result.is_fallback and self.dts_sampler is not None:
                 sampled = self.dts_sampler.sample(pln_fb_key, self._dts_rng)

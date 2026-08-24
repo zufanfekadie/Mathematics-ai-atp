@@ -51,7 +51,7 @@ class RLSearchResult:
 
 
 def _fingerprint(goal: Goal, tactic_name: str, arguments: tuple[str, ...]) -> tuple:
-    return (goal.expression, tuple(goal.hypotheses), tactic_name, arguments)
+    return (goal.expression, tuple(h.render() for h in goal.hypotheses), tactic_name, arguments)
 
 
 class RLHybridReasoner(HybridReasoner):
