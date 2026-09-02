@@ -15,6 +15,10 @@ class LocalDeclaration(BaseModel):
     type_expression: str
     value_expression: str | None = None
     kind: Literal["variable", "let"] = "variable"
+    sexp: str | None = None
+    context_index: int | None = None
+    role: str = "context"
+    is_instance: bool = False
 
     @classmethod
     def from_text(cls, declaration: str) -> "LocalDeclaration":
@@ -26,6 +30,7 @@ class LocalDeclaration(BaseModel):
                 type_expression=match.group(2).strip(),
                 value_expression=match.group(3).strip(),
                 kind="let",
+                role="let",
             )
         if ":" not in text:
             raise ValueError(f"local declaration must contain ':': {declaration!r}")
@@ -49,6 +54,7 @@ class Goal(BaseModel):
 
     expression: str
     hypotheses: List[LocalDeclaration] = Field(default_factory=list)
+    goal_sexp: str | None = None
 
     @field_validator("hypotheses", mode="before")
     @classmethod

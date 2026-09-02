@@ -12,11 +12,11 @@ from maths_ai.pln_inference.metta.translator.translator_modules.parser import (
 
 
 def patch_pantograph_for_sexp() -> None:
-    """Monkey-patch Pantograph to return S-expressions instead of pretty-printed strings.
+    """Monkey-patch Pantograph to retain S-expressions and model metadata.
 
     After calling this, ``Goal.target`` and ``Variable.t`` will contain the
-    Lean S-expression (e.g. ``((:c Eq) (:c Nat) ...)``) instead of the
-    human-readable ``n = n`` form.
+    Lean S-expression (e.g. ``((:c Eq) (:c Nat) ...)``) with model variable
+    representations (``modelSexp``), contextIndex, and binderRole preserved.
 
     Must be called BEFORE creating a Server instance.
     """
@@ -24,10 +24,52 @@ def patch_pantograph_for_sexp() -> None:
     import pantograph.server as server_mod
 
     def _parse_expr_sexp(payload: dict) -> str:
-        return payload.get("sexp") or payload["pp"]
+        if isinstance(payload, dict):
+            return payload.get("modelSexp") or payload.get("sexp") or payload.get("pp", "")
+        return str(payload)
 
     expr_mod.parse_expr = _parse_expr_sexp
     server_mod.parse_expr = _parse_expr_sexp
+
+    orig_var_parse = getattr(expr_mod.Variable, "parse", None)
+
+    def _parse_variable_with_meta(payload: dict):
+        if orig_var_parse is not None:
+            var = orig_var_parse(payload)
+        else:
+            var = expr_mod.Variable(
+                userName=payload.get("userName") or payload.get("name"),
+                type=expr_mod.parse_expr(payload.get("type", {})),
+                value=expr_mod.parse_expr(payload.get("value", {})) if payload.get("value") is not None else None,
+            )
+        object.__setattr__(var, "context_index", payload.get("contextIndex"))
+        object.__setattr__(var, "binder_role", payload.get("binderRole", "context"))
+        object.__setattr__(var, "is_instance", payload.get("isInstance", False))
+        object.__setattr__(var, "is_let", payload.get("isLet", False) or var.v is not None)
+        type_dict = payload.get("type") if isinstance(payload.get("type"), dict) else {}
+        object.__setattr__(var, "model_sexp", type_dict.get("modelSexp") or type_dict.get("sexp"))
+        object.__setattr__(var, "pp_t", type_dict.get("pp", str(var.t)))
+        return var
+
+    expr_mod.Variable.parse = staticmethod(_parse_variable_with_meta)
+
+    orig_goal_parse = getattr(expr_mod.Goal, "parse", None)
+
+    def _parse_goal_with_meta(payload: dict):
+        if orig_goal_parse is not None:
+            g = orig_goal_parse(payload)
+        else:
+            g = expr_mod.Goal(
+                name=payload.get("name", ""),
+                target=expr_mod.parse_expr(payload.get("target", {})),
+                variables=[expr_mod.Variable.parse(v) for v in payload.get("variables", [])],
+            )
+        target_dict = payload.get("target") if isinstance(payload.get("target"), dict) else {}
+        object.__setattr__(g, "model_sexp", target_dict.get("modelSexp") or target_dict.get("sexp"))
+        object.__setattr__(g, "pp_target", target_dict.get("pp", str(g.target)))
+        return g
+
+    expr_mod.Goal.parse = staticmethod(_parse_goal_with_meta)
 
 
 def goal_state_to_proof_state(goal_state) -> tuple[str, list[tuple[str, str | None]], str | None]:
@@ -45,14 +87,16 @@ def goal_state_to_proof_state(goal_state) -> tuple[str, list[tuple[str, str | No
         return "", [], None
 
     goal = goal_state.goals[0]
-    goal_sexp = goal.target  # Already an S-expression after patching
-    hyp_sexps = [(v.name or "_", v.t) for v in goal.variables]
+    goal_sexp = getattr(goal, "model_sexp", str(goal.target))
+    hyp_sexps = [(v.name or "_", getattr(v, "model_sexp", str(v.t))) for v in goal.variables]
 
-    # Build text representation for backward compatibility
+    # Build text representation using pretty-printed strings when available
     lines = []
     for v in goal.variables:
-        lines.append(f"{v.name or '_'} : {v.t}")
-    text_state = "\n".join(lines) + f"\n⊢ {goal_sexp}" if lines else f"⊢ {goal_sexp}"
+        t_str = getattr(v, "pp_t", str(v.t))
+        lines.append(f"{v.name or '_'} : {t_str}")
+    pp_target = getattr(goal, "pp_target", str(goal.target))
+    text_state = "\n".join(lines) + f"\n⊢ {pp_target}" if lines else f"⊢ {pp_target}"
 
     return text_state, hyp_sexps, goal_sexp
 
@@ -117,8 +161,10 @@ def _classify_label(label: str) -> str:
         return "var"
     if label in ("App", "Arrow", "Forall", "Explicit"):
         return "app"
-    if label in ("Hyp", "Goal", "State"):
+    if label in ("Hyp", "Goal", "State", "Let") or label.startswith("HypRole:"):
         return "meta"
+    if label.startswith("FV") and label[2:].isdigit():
+        return "var"
     if label == "\u2115" or (label[0].isupper() and len(label) <= 2):
         return "type"
     if label[0].isupper():
@@ -317,6 +363,7 @@ def proof_state_to_dag(
     sexp: str | None = None,
     goal_sexp: str | None = None,
     hyp_sexps: list[tuple[str, str | None]] | None = None,
+    hyp_details: list[dict] | None = None,
 ) -> DAGBuilder:
     """Build a DAG from a proof state.
 
@@ -324,33 +371,57 @@ def proof_state_to_dag(
 
     1. ``state`` is a text string → parse with ExprParser (old path).
     2. ``sexp`` is provided → goal type parsed via ``_sexp_walk``.
-    3. ``goal_sexp`` + ``hyp_sexps`` are provided → both goal and hypothesis
-       types parsed via ``_sexp_walk`` (preferred path when Pantograph is
-       available with ``printExprAST: true``).
+    3. ``goal_sexp`` + ``hyp_sexps``/``hyp_details`` are provided → both goal
+       and hypothesis types parsed via ``_sexp_walk`` with 4-child Hyp nodes
+       matching the training distribution: Hyp(FV{i}, name, HypRole:role, type).
     """
     parsed = state if isinstance(state, ProofState) else parse_state(state)
 
-    if goal_sexp is not None and hyp_sexps is not None:
-        # Best path: S-expressions for both goal and hypothesis types
-        dag = sexp_to_dag(goal_sexp)
-        goal_expr_id = dag.num_nodes - 1
+    if goal_sexp is not None and (hyp_sexps is not None or hyp_details is not None):
+        # Best path: S-expressions with rich 4-child Hyp(FV{i}, name, HypRole:role, type)
+        dag = DAGBuilder()
+        parsed_goal = parse_sexp_string(goal_sexp) if isinstance(goal_sexp, str) else goal_sexp
+        goal_expr_id = _sexp_walk(parsed_goal, [], dag)
 
         root_ids: list[int] = []
-        for hyp, (hyp_name, hyp_sexp) in zip(parsed.hypotheses, hyp_sexps):
-            name_node = dag.get_or_create(hyp_name or hyp.name, ())
+        for i, hyp in enumerate(parsed.hypotheses):
+            details = hyp_details[i] if (hyp_details is not None and i < len(hyp_details)) else {}
+            if isinstance(details, dict) and details:
+                hyp_name = details.get("name") or hyp.name or "_"
+                hyp_sexp = details.get("sexp")
+                ctx_idx = details.get("context_index")
+                role = details.get("role", "let" if hyp.is_local_definition else "context")
+            else:
+                entry = hyp_sexps[i] if (hyp_sexps and i < len(hyp_sexps)) else (hyp.name, None)
+                hyp_name = entry[0] or hyp.name or "_"
+                hyp_sexp = entry[1] if len(entry) > 1 else None
+                ctx_idx = entry[2] if len(entry) > 2 else None
+                role = entry[3] if len(entry) > 3 else ("let" if hyp.is_local_definition else "context")
+
+            if ctx_idx is None:
+                ctx_idx = i
+
+            fv_node = dag.get_or_create(f"FV{ctx_idx}", ())
+            name_node = dag.get_or_create(hyp_name, ())
+            role_node = dag.get_or_create(f"HypRole:{role}", ())
+
             if hyp_sexp:
-                type_node = _sexp_walk(parse_sexp_string(hyp_sexp), [], dag)
+                parsed_hyp = parse_sexp_string(hyp_sexp) if isinstance(hyp_sexp, str) else hyp_sexp
+                type_node = _sexp_walk(parsed_hyp, [], dag)
             elif hyp.type_expr:
                 from .parser import ExprParser
                 _hyp_parser = ExprParser(dag)
                 type_node = _hyp_parser.parse(hyp.type_expr)
             else:
                 type_node = dag.get_or_create("?", ())
-            if hyp.is_local_definition:
+
+            if hyp.is_local_definition and getattr(hyp, "value_expr", None):
+                from .parser import ExprParser
+                _hyp_parser = ExprParser(dag)
                 value_node = _hyp_parser.parse(hyp.value_expr)
-                hyp_node = dag.get_or_create("Let", (name_node, type_node, value_node))
+                hyp_node = dag.get_or_create("Let", (fv_node, name_node, role_node, type_node, value_node))
             else:
-                hyp_node = dag.get_or_create("Hyp", (name_node, type_node))
+                hyp_node = dag.get_or_create("Hyp", (fv_node, name_node, role_node, type_node))
             root_ids.append(hyp_node)
 
         goal_node = dag.get_or_create("Goal", (goal_expr_id,))
@@ -360,21 +431,24 @@ def proof_state_to_dag(
 
     if sexp is not None:
         # Goal has S-expression, hypothesis types use text parser
-        dag = sexp_to_dag(sexp)
-        goal_expr_id = dag.num_nodes - 1
+        dag = DAGBuilder()
+        parsed_goal = parse_sexp_string(sexp) if isinstance(sexp, str) else sexp
+        goal_expr_id = _sexp_walk(parsed_goal, [], dag)
 
         from .parser import ExprParser
         _hyp_parser = ExprParser(dag)
 
         root_ids: list[int] = []
-        for hypothesis in parsed.hypotheses:
-            name_node = dag.get_or_create(hypothesis.name, ())
+        for i, hypothesis in enumerate(parsed.hypotheses):
+            fv_node = dag.get_or_create(f"FV{i}", ())
+            name_node = dag.get_or_create(hypothesis.name or "_", ())
+            role_node = dag.get_or_create(f"HypRole:{'let' if hypothesis.is_local_definition else 'context'}", ())
             type_node = _hyp_parser.parse(hypothesis.type_expr) if hypothesis.type_expr else dag.get_or_create("?", ())
-            if hypothesis.is_local_definition:
+            if hypothesis.is_local_definition and getattr(hypothesis, "value_expr", None):
                 value_node = _hyp_parser.parse(hypothesis.value_expr)
-                hyp_node = dag.get_or_create("Let", (name_node, type_node, value_node))
+                hyp_node = dag.get_or_create("Let", (fv_node, name_node, role_node, type_node, value_node))
             else:
-                hyp_node = dag.get_or_create("Hyp", (name_node, type_node))
+                hyp_node = dag.get_or_create("Hyp", (fv_node, name_node, role_node, type_node))
             root_ids.append(hyp_node)
 
         goal_node = dag.get_or_create("Goal", (goal_expr_id,))
@@ -389,35 +463,15 @@ def proof_state_to_dag(
     parser = ExprParser(dag)
     root_ids = []
 
-    for hypothesis in parsed.hypotheses:
-        name_node = dag.get_or_create(hypothesis.name, ())
+    for i, hypothesis in enumerate(parsed.hypotheses):
+        fv_node = dag.get_or_create(f"FV{i}", ())
+        name_node = dag.get_or_create(hypothesis.name or "_", ())
+        role_node = dag.get_or_create(f"HypRole:{'let' if hypothesis.is_local_definition else 'context'}", ())
         type_node = parser.parse(hypothesis.type_expr) if hypothesis.type_expr else dag.get_or_create("?", ())
-        if hypothesis.is_local_definition:
+        if hypothesis.is_local_definition and getattr(hypothesis, "value_expr", None):
             value_node = parser.parse(hypothesis.value_expr)
-            hyp_node = dag.get_or_create("Let", (name_node, type_node, value_node))
+            hyp_node = dag.get_or_create("Let", (fv_node, name_node, role_node, type_node, value_node))
         else:
-            hyp_node = dag.get_or_create("Hyp", (name_node, type_node))
-        root_ids.append(hyp_node)
-
-    goal_expr_node = parser.parse(parsed.goal)
-    goal_node = dag.get_or_create("Goal", (goal_expr_node,))
-    root_ids.append(goal_node)
-    dag.get_or_create("State", tuple(root_ids))
-
-    return dag
-
-
-def lemma_statement_to_dag(statement: str, *, sexp: str | None = None) -> DAGBuilder:
-    """Build a DAG for a lemma statement treated as a goal-only proof state.
-
-    If *sexp* is provided, uses the new Lean AST parser.
-    Otherwise falls back to the old text-based parser.
-    """
-    if sexp is not None:
-        dag = sexp_to_dag(sexp)
-        goal_node = dag.get_or_create("Goal", (dag.num_nodes - 1,))
-        dag.get_or_create("State", (goal_node,))
-        return dag
 
     from .parser import ExprParser
 

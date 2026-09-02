@@ -22,4 +22,5 @@ PeTTaChainer/
 
 .lake/
 
-.claude/
+.claude/.venv-stale/
+.venv-stale/

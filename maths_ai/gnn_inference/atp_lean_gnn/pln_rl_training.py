@@ -127,7 +127,27 @@ def make_dag_featurizer(node_vocab: dict[str, int]):
     state_label_id = node_vocab.get("State", 0)
 
     def featurize(goal: Goal):
-        dag = proof_state_to_dag(goal_to_state(goal))
+        if goal.goal_sexp is not None or any(h.sexp is not None for h in goal.hypotheses):
+            hyp_sexps = [(h.name, h.sexp) for h in goal.hypotheses]
+            hyp_details = [
+                {
+                    "name": h.name,
+                    "sexp": h.sexp,
+                    "context_index": h.context_index if h.context_index is not None else i,
+                    "role": h.role,
+                    "is_let": h.kind == "let",
+                    "value_sexp": None,
+                }
+                for i, h in enumerate(goal.hypotheses)
+            ]
+            dag = proof_state_to_dag(
+                goal_to_state(goal),
+                goal_sexp=goal.goal_sexp,
+                hyp_sexps=hyp_sexps,
+                hyp_details=hyp_details,
+            )
+        else:
+            dag = proof_state_to_dag(goal_to_state(goal))
         data = dag_to_pyg(dag, node_vocab, add_reverse_edges=True)
         data.premise_mask = torch.tensor(build_premise_mask(dag), dtype=torch.bool)
         matches = (data.x == state_label_id).nonzero(as_tuple=False).view(-1)

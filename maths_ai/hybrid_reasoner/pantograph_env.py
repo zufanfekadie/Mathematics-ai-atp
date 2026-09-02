@@ -159,10 +159,11 @@ class PantographEnv:
         consults ``start``, so the deferred spawn still receives a fully resolved
         ``LEAN_PATH``.
         """
+        options = {"printExprModelAST": True, **dict(self.options)}
         server = await Server.create(
             imports=list(self.imports),
             project_path=str(self.source_root) if self.source_root else None,
-            options=dict(self.options),
+            options=options,
             timeout=self.timeout,
             start=False,
         )

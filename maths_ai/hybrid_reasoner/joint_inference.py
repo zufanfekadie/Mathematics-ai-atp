@@ -214,15 +214,20 @@ class PantographExecutor(TacticExecutor):
 
         subgoals = [
             Goal(
-                expression=str(g.target),
+                expression=getattr(g, "pp_target", str(g.target)),
+                goal_sexp=getattr(g, "model_sexp", str(g.target) if str(g.target).startswith("(") else None),
                 hypotheses=[
                     LocalDeclaration(
                         name=v.name or "_",
-                        type_expression=str(v.t),
+                        type_expression=getattr(v, "pp_t", str(v.t)),
                         value_expression=str(v.v) if v.v is not None else None,
-                        kind="let" if v.v is not None else "variable",
+                        kind="let" if (getattr(v, "is_let", False) or v.v is not None) else "variable",
+                        sexp=getattr(v, "model_sexp", str(v.t) if str(v.t).startswith("(") else None),
+                        context_index=getattr(v, "context_index", idx),
+                        role=getattr(v, "binder_role", "let" if v.v is not None else "context"),
+                        is_instance=getattr(v, "is_instance", False),
                     )
-                    for v in g.variables
+                    for idx, v in enumerate(g.variables)
                 ],
             )
             for g in new_state.goals
@@ -598,6 +603,8 @@ class HybridReasoner:
         if variable_names:
             names = " ".join(variable_names)
             state = await self.server.goal_tactic_async(state, f"intro {names}")
+        else:
+            state = await self.server.goal_tactic_async(state, "skip")
         return state
 
     def _link(

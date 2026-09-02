@@ -35,9 +35,20 @@ _NO_ARGS_TACTICS = frozenset({"constructor", "assumption", "trivial", "omega", "
 
 def _resolve_local_node_name(node: GraphNode, dag: DAGBuilder) -> str:
     """Attempt to extract a readable hypothesis or variable name from a node."""
-    if node.label == "Hyp" and node.children:
+    if node.label in ("Hyp", "Let") and node.children:
+        # If 4-child Hyp(FV{i}, name, HypRole:role, type): child 1 is the name node
+        if len(node.children) >= 2 and dag.nodes[node.children[0]].label.startswith("FV"):
+            name_node = dag.nodes[node.children[1]]
+            return name_node.label
         name_node = dag.nodes[node.children[0]]
         return name_node.label
+
+    # If an FV{i} node was selected directly, look up the Hyp parent's name child
+    if node.label.startswith("FV") and node.label[2:].isdigit():
+        for n in dag.nodes:
+            if n.label in ("Hyp", "Let") and len(n.children) >= 2 and n.children[0] == node.id:
+                return dag.nodes[n.children[1]].label
+
     return node.label
 
 
