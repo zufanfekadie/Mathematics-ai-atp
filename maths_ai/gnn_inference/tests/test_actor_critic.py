@@ -209,7 +209,7 @@ class ActorCriticTests(unittest.TestCase):
         returns = torch.tensor([1.0, 0.0], dtype=torch.float32)
         selected_arg_indices = [
             torch.tensor([0, 1], dtype=torch.long),
-            torch.tensor([2, 3], dtype=torch.long)
+            torch.tensor([0, 1], dtype=torch.long)
         ]
         success_mask = torch.tensor([True, False], dtype=torch.bool)
 

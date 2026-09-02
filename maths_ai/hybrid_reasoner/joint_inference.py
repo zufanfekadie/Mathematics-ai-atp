@@ -603,8 +603,6 @@ class HybridReasoner:
         if variable_names:
             names = " ".join(variable_names)
             state = await self.server.goal_tactic_async(state, f"intro {names}")
-        else:
-            state = await self.server.goal_tactic_async(state, "skip")
         return state
 
     def _link(
