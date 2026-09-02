@@ -91,9 +91,6 @@ def extract_stv_scores(log_text: str) -> list[tuple[float, float]]:
     proof_scores: list[tuple[float, float]] = []
 
     for line in log_text.splitlines():
-        if "rule-proof" not in line:
-            continue
-
         for strength, confidence in stv_pattern.findall(line):
             proof_scores.append((float(strength), float(confidence)))
 
