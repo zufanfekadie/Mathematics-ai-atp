@@ -8,20 +8,39 @@ tactic string.
 from __future__ import annotations
 
 import re
-import torch
-from torch_geometric.data import Batch
 
-from .argument_selector import TacticWithArgsClassifier
-from .actor_critic import ActorCriticWithArgsClassifier
 from .graph import DAGBuilder, GraphNode, proof_state_to_dag, goal_state_to_proof_state
 from .labels import get_tactic_arity
 from .lemma_corpus import LemmaRecord
-from .lemma_index import LemmaIndex
-from .premise_pool import build_unified_pools
-from .premise_scoring import PremiseScorer
-from .pyg import build_premise_mask, dag_to_pyg
 from .state import ProofState, parse_state
-from .training import transform_edge_index
+
+try:
+    import torch
+    from torch_geometric.data import Batch
+    from .argument_selector import TacticWithArgsClassifier
+    from .actor_critic import ActorCriticWithArgsClassifier
+    from .lemma_index import LemmaIndex
+    from .premise_pool import build_unified_pools
+    from .premise_scoring import PremiseScorer
+    from .pyg import build_premise_mask, dag_to_pyg
+    from .training import transform_edge_index
+except ImportError:
+    class _DummyTorch:
+        @staticmethod
+        def no_grad():
+            def decorator(fn):
+                return fn
+            return decorator
+    torch = _DummyTorch()
+    Batch = None
+    TacticWithArgsClassifier = None
+    ActorCriticWithArgsClassifier = None
+    LemmaIndex = None
+    build_unified_pools = None
+    PremiseScorer = None
+    build_premise_mask = None
+    dag_to_pyg = None
+    transform_edge_index = None
 
 # ── Tactic-aware argument filtering rules ──────────────────────────────────
 # Fresh name only: generate a new identifier, reject all candidates

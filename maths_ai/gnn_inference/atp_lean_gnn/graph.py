@@ -472,7 +472,17 @@ def proof_state_to_dag(
             value_node = parser.parse(hypothesis.value_expr)
             hyp_node = dag.get_or_create("Let", (fv_node, name_node, role_node, type_node, value_node))
         else:
+            hyp_node = dag.get_or_create("Hyp", (fv_node, name_node, role_node, type_node))
+        root_ids.append(hyp_node)
 
+    goal_expr_node = parser.parse(parsed.goal)
+    goal_node = dag.get_or_create("Goal", (goal_expr_node,))
+    root_ids.append(goal_node)
+    dag.get_or_create("State", tuple(root_ids))
+    return dag
+
+
+def lemma_statement_to_dag(statement: str) -> DAGBuilder:
     from .parser import ExprParser
 
     dag = DAGBuilder()
