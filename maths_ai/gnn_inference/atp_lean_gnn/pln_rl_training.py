@@ -20,13 +20,24 @@ import asyncio
 from dataclasses import dataclass, replace
 from typing import Callable
 
-import torch
-from torch_geometric.data import Batch, Data
+try:
+    import torch
+    from torch_geometric.data import Batch, Data
+    from .actor_critic import ActorCriticWithArgsClassifier
+    from .actor_critic_loss import compute_bc_anchor_loss, compute_critic_loss, compute_entropy_bonus
+    from .pyg import build_premise_mask, dag_to_pyg
+except ImportError:
+    torch = None
+    Batch = None
+    Data = None
+    ActorCriticWithArgsClassifier = None
+    compute_bc_anchor_loss = None
+    compute_critic_loss = None
+    compute_entropy_bonus = None
+    build_premise_mask = None
+    dag_to_pyg = None
 
-from .actor_critic import ActorCriticWithArgsClassifier
-from .actor_critic_loss import compute_bc_anchor_loss, compute_critic_loss, compute_entropy_bonus
 from .graph import proof_state_to_dag
-from .pyg import build_premise_mask, dag_to_pyg
 from .pln_reward import RewardConfig
 from .search_harvest import (
     ActorTransition,

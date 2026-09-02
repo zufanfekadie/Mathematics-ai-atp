@@ -25,12 +25,17 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Deque, Dict, List, Optional, Protocol, Set, Tuple
+from typing import Any, Deque, Dict, List, Optional, Protocol, Set, Tuple
 
 from maths_ai.data_models.proof_components import STV, Goal, TacticCandidate
 from maths_ai.data_models.proof_components import GoalState as GoalStateModel
-from pantograph import Server
-from pantograph.server import GoalState
+
+try:
+    from pantograph import Server
+    from pantograph.server import GoalState
+except ImportError:
+    Server = Any
+    GoalState = Any
 
 class NodeStatus:
     OPEN = "open"          # not yet expanded; eligible for the search frontier
